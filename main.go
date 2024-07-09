@@ -6,19 +6,19 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"github.com/bmizerany/perks/quantile"
 	"io"
 	"log"
 	"mime"
 	"net"
 	"net/http"
-	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/fatih/color"
@@ -26,23 +26,26 @@ import (
 
 const (
 	httpsTemplate = `` +
-		`  DNS Lookup   TCP Connection   TLS Handshake   Server Processing   Content Transfer` + "\n" +
-		`[%s  |     %s  |    %s  |        %s  |       %s  ]` + "\n" +
-		`            |                |               |                   |                  |` + "\n" +
-		`   namelookup:%s      |               |                   |                  |` + "\n" +
-		`                       connect:%s     |                   |                  |` + "\n" +
-		`                                   pretransfer:%s         |                  |` + "\n" +
-		`                                                     starttransfer:%s        |` + "\n" +
-		`                                                                                total:%s` + "\n"
+		`| DNS Lookup | TCP Connection | TLS Handshake | Request Transfer X Server Processing | Content Transfer|` + "\n" +
+		`[ %s  | %s      | %s     | %s        | %s         | %s       ]` + "\n" +
+		`             |                |               |                  |                   |                 |` + "\n" +
+		`   namelookup:%s       |               |                  |                   |                 |` + "\n" +
+		`                       connect:%s      |                  |                   |                 |` + "\n" +
+		`                                           tls:%s         |                   |                 |` + "\n" +
+		`                                                     reqtransferH:%s          |                 |` + "\n" +
+		`                                                      reqtransfer:%s          |                 |` + "\n" +
+		`                                                                        starttransfer:%s        |` + "\n" +
+		`                                                                                                  total:%s` + "\n"
 
 	httpTemplate = `` +
-		`   DNS Lookup   TCP Connection   Server Processing   Content Transfer` + "\n" +
-		`[ %s  |     %s  |        %s  |       %s  ]` + "\n" +
-		`             |                |                   |                  |` + "\n" +
-		`    namelookup:%s      |                   |                  |` + "\n" +
-		`                        connect:%s         |                  |` + "\n" +
-		`                                      starttransfer:%s        |` + "\n" +
-		`                                                                 total:%s` + "\n"
+		`|  DNS Lookup | TCP Connection | Request Transfer X Server Processing | Content Transfer|` + "\n" +
+		`[%s    | %s      | %s         | %s        | %s       ]` + "\n" +
+		`              |                |                   |                  |                 |` + "\n" +
+		`    namelookup:%s       |                   |                  |                 |` + "\n" +
+		`                        connect:%s          |                  |                 |` + "\n" +
+		`                                        reqtransfer:%s         |                 |` + "\n" +
+		`                                                          starttransfer:%s       |` + "\n" +
+		`                                                                                   total:%s` + "\n"
 )
 
 var (
@@ -59,6 +62,8 @@ var (
 	clientCertFile  string
 	fourOnly        bool
 	sixOnly         bool
+
+	count uint
 
 	// number of redirects followed
 	redirectsFollowed int
@@ -82,6 +87,8 @@ func init() {
 	flag.BoolVar(&fourOnly, "4", false, "resolve IPv4 addresses only")
 	flag.BoolVar(&sixOnly, "6", false, "resolve IPv6 addresses only")
 
+	flag.UintVar(&count, "c", 1, "execute repeat count")
+
 	flag.Usage = usage
 }
 
@@ -104,6 +111,9 @@ func printf(format string, a ...interface{}) (n int, err error) {
 func grayscale(code color.Attribute) func(string, ...interface{}) string {
 	return color.New(code + 232).SprintfFunc()
 }
+
+var successCounter atomic.Int32
+var requestCounter atomic.Int32
 
 func main() {
 	flag.Parse()
@@ -134,7 +144,188 @@ func main() {
 
 	url := parseURL(args[0])
 
-	visit(url)
+	statCh := make(chan *httpStat, 1000)
+	closeCh := make(chan struct{})
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	go printStatsTask(ctx, statCh, closeCh)
+	for c := 0; c < int(count); c++ {
+		requestCounter.Add(1)
+		stat, err := visit(url)
+		if err != nil {
+			log.Printf("ERROR: failed to visit %s: %v", url, err)
+			continue
+		}
+		successCounter.Add(1)
+		statCh <- &stat
+	}
+
+	cancelFunc()
+	<-closeCh
+}
+
+func printStatsTask(ctx context.Context, statCh <-chan *httpStat, closeCh chan struct{}) {
+	// Print stats of publish rate and latencies
+	tick := time.NewTicker(3 * time.Second)
+	defer tick.Stop()
+	dnsLookupQ := quantile.NewTargeted(0, 0.50, 0.95, 0.99, 0.999, 1.0)
+	tcpConnectQ := quantile.NewTargeted(0, 0.50, 0.95, 0.99, 0.999, 1.0)
+	tlsHandshakeQ := quantile.NewTargeted(0, 0.50, 0.95, 0.99, 0.999, 1.0)
+	reqTransferQ := quantile.NewTargeted(0, 0.50, 0.95, 0.99, 0.999, 1.0)
+	reqTransferHQ := quantile.NewTargeted(0, 0.50, 0.95, 0.99, 0.999, 1.0)
+	svrProcessingQ := quantile.NewTargeted(0, 0.50, 0.95, 0.99, 0.999, 1.0)
+	respTransferQ := quantile.NewTargeted(0, 0.50, 0.95, 0.99, 0.999, 1.0)
+
+	curlRespTransferredQ := quantile.NewTargeted(0, 0.50, 0.95, 0.99, 0.999, 1.0)
+
+	totalStat := httpStat{}
+
+	counter := 0
+	for {
+		select {
+		case <-ctx.Done():
+			printStat(printStatOption{
+				dnsLookupQ:           dnsLookupQ,
+				tcpConnectQ:          tcpConnectQ,
+				tlsHandshakeQ:        tlsHandshakeQ,
+				reqTransferHQ:        reqTransferHQ,
+				reqTransferQ:         reqTransferQ,
+				svrProcessingQ:       svrProcessingQ,
+				respTransferQ:        respTransferQ,
+				curlRespTransferredQ: curlRespTransferredQ,
+				counter:              counter,
+				totalStat:            &totalStat,
+			})
+			closeCh <- struct{}{}
+			return
+		case <-tick.C:
+			printStat(printStatOption{
+				dnsLookupQ:           dnsLookupQ,
+				tcpConnectQ:          tcpConnectQ,
+				tlsHandshakeQ:        tlsHandshakeQ,
+				reqTransferHQ:        reqTransferHQ,
+				reqTransferQ:         reqTransferQ,
+				svrProcessingQ:       svrProcessingQ,
+				respTransferQ:        respTransferQ,
+				curlRespTransferredQ: curlRespTransferredQ,
+				counter:              counter,
+				totalStat:            &totalStat,
+			})
+			//dnsLookupQ.Reset()
+		case stat := <-statCh:
+			dnsLookupQ.Insert(float64(stat.dnsLookup / time.Millisecond))
+			tcpConnectQ.Insert(float64(stat.tcpConnect / time.Millisecond))
+			tlsHandshakeQ.Insert(float64(stat.tlsHandshake / time.Millisecond))
+			reqTransferHQ.Insert(float64(stat.reqTransferH / time.Millisecond))
+			reqTransferQ.Insert(float64(stat.reqTransfer / time.Millisecond))
+			svrProcessingQ.Insert(float64(stat.svrProcessing / time.Millisecond))
+			respTransferQ.Insert(float64(stat.respTransfer / time.Millisecond))
+			curlRespTransferredQ.Insert(float64(stat.curlRespTransferred / time.Millisecond))
+
+			totalStat.dnsLookup += stat.dnsLookup
+			totalStat.tcpConnect += stat.tcpConnect
+			totalStat.tlsHandshake += stat.tlsHandshake
+			totalStat.reqTransferH += stat.reqTransferH
+			totalStat.reqTransfer += stat.reqTransfer
+			totalStat.svrProcessing += stat.svrProcessing
+			totalStat.respTransfer += stat.respTransfer
+
+			totalStat.curlConnected += stat.curlConnected
+			totalStat.curlTLSHandShook += stat.curlTLSHandShook
+			totalStat.curlGotConn += stat.curlGotConn
+			totalStat.curlWroteHeaders += stat.curlWroteHeaders
+			totalStat.curlReqTransferred += stat.curlReqTransferred
+			totalStat.curlGotFirstResponseByte += stat.curlGotFirstResponseByte
+			totalStat.curlRespTransferred += stat.curlRespTransferred
+
+			counter++
+		}
+	}
+}
+
+type printStatOption struct {
+	dnsLookupQ           *quantile.Stream
+	tcpConnectQ          *quantile.Stream
+	tlsHandshakeQ        *quantile.Stream
+	reqTransferHQ        *quantile.Stream
+	reqTransferQ         *quantile.Stream
+	svrProcessingQ       *quantile.Stream
+	respTransferQ        *quantile.Stream
+	curlRespTransferredQ *quantile.Stream
+
+	totalStat *httpStat
+	counter   int
+}
+
+func printStat(opt printStatOption) {
+	if opt.counter <= 0 {
+		fmt.Println("all requests were not success")
+		return
+	}
+	fmta := func(d time.Duration) string {
+		return color.CyanString("%7dms", int(d/time.Millisecond))
+	}
+
+	fmtb := func(d time.Duration) string {
+		return color.CyanString("%-9s", strconv.Itoa(int(d/time.Millisecond))+"ms")
+	}
+
+	counterD := time.Duration(opt.counter)
+	fmtSTA := func(total time.Duration, counter int, q *quantile.Stream) string {
+		cD := time.Duration(counter)
+		seGs := make([]string, 0)
+		seGs = append(seGs, fmt.Sprintf("%-12s", fmt.Sprintf("AVG=%dms", total/cD/time.Millisecond)))
+		seGs = append(seGs, fmt.Sprintf("%-12s", fmt.Sprintf("MIN=%.0fms", q.Query(0))))
+		seGs = append(seGs, fmt.Sprintf("%-12s", fmt.Sprintf("P50=%.0fms", q.Query(0.5))))
+		seGs = append(seGs, fmt.Sprintf("%-12s", fmt.Sprintf("P95=%.0fms", q.Query(0.95))))
+		seGs = append(seGs, fmt.Sprintf("%-12s", fmt.Sprintf("P99=%.0fms", q.Query(0.99))))
+		seGs = append(seGs, fmt.Sprintf("%-12s", fmt.Sprintf("MAX=%.0fms", q.Query(1))))
+		return strings.Join(seGs, "| ")
+	}
+
+	colorize := func(s string) string {
+		v := strings.Split(s, "\n")
+		v[0] = grayscale(16)(v[0])
+		return strings.Join(v, "\n")
+	}
+	totalStat := opt.totalStat
+	dnsLookupQ := opt.dnsLookupQ
+	tcpConnectQ := opt.tcpConnectQ
+	tlsHandshakeQ := opt.tlsHandshakeQ
+	reqTransferHQ := opt.reqTransferHQ
+	reqTransferQ := opt.reqTransferQ
+	svrProcessingQ := opt.svrProcessingQ
+	respTransferQ := opt.respTransferQ
+	curlRespTransferredQ := opt.curlRespTransferredQ
+
+	fmt.Println("--------------------------------------------------------------------------------------")
+	fmt.Printf("DNS Lookup    : %s\n", fmtSTA(opt.totalStat.dnsLookup, opt.counter, dnsLookupQ))
+	fmt.Printf("TCP Connect   : %s\n", fmtSTA(opt.totalStat.tcpConnect, opt.counter, tcpConnectQ))
+	fmt.Printf("TLS Handshake : %s\n", fmtSTA(opt.totalStat.tlsHandshake, opt.counter, tlsHandshakeQ))
+	fmt.Printf("Req TransferH : %s\n", fmtSTA(opt.totalStat.reqTransferH, opt.counter, reqTransferHQ))
+	fmt.Printf("Req Transfer  : %s\n", fmtSTA(opt.totalStat.reqTransfer, opt.counter, reqTransferQ))
+	fmt.Printf("SVR Processing: %s\n", fmtSTA(opt.totalStat.svrProcessing, opt.counter, svrProcessingQ))
+	fmt.Printf("Resp Transfer : %s\n", fmtSTA(opt.totalStat.respTransfer, opt.counter, respTransferQ))
+	fmt.Println("--------------------------------------------------------------------------------------")
+	fmt.Printf("CURLResponseLA: %s\n", fmtSTA(opt.totalStat.curlRespTransferred, opt.counter, curlRespTransferredQ))
+	fmt.Println("--------------------------------------------------------------------------------------")
+	fmt.Printf("CURLSuccessRate: %.2f (%d/%d)\n", float32(successCounter.Load())/float32(requestCounter.Load()), successCounter.Load(), requestCounter.Load())
+	fmt.Println("--------------------------------------------------------------------------------------")
+
+	printf(colorize(httpsTemplate),
+		fmta(totalStat.dnsLookup/counterD),                // dns lookup
+		fmta(totalStat.tcpConnect/counterD),               // tcp connection
+		fmta(totalStat.tlsHandshake/counterD),             // tls handshake
+		fmta(totalStat.reqTransfer/counterD),              // request transfer (add)
+		fmta(totalStat.svrProcessing/counterD),            // server processing
+		fmta(totalStat.respTransfer/counterD),             // content transfer
+		fmtb(totalStat.dnsLookup/counterD),                // namelookup
+		fmtb(totalStat.curlConnected/counterD),            // connect
+		fmtb(totalStat.curlTLSHandShook/counterD),         // tls (rename)
+		fmtb(totalStat.curlWroteHeaders/counterD),         // pretransferHeaders (add)
+		fmtb(totalStat.curlReqTransferred/counterD),       // pretransfer --> request transfer (add)
+		fmtb(totalStat.curlGotFirstResponseByte/counterD), // starttransfer
+		fmtb(totalStat.curlRespTransferred/counterD),      // total
+	)
 }
 
 // readClientCert - helper function to read client certificate
@@ -210,181 +401,6 @@ func dialContext(network string) func(ctx context.Context, network, addr string)
 			KeepAlive: 30 * time.Second,
 			DualStack: false,
 		}).DialContext(ctx, network, addr)
-	}
-}
-
-// visit visits a url and times the interaction.
-// If the response is a 30x, visit follows the redirect.
-func visit(url *url.URL) {
-	req := newRequest(httpMethod, url, postBody)
-
-	var t0, t1, t2, t3, t4, t5, t6 time.Time
-
-	trace := &httptrace.ClientTrace{
-		DNSStart: func(_ httptrace.DNSStartInfo) { t0 = time.Now() },
-		DNSDone:  func(_ httptrace.DNSDoneInfo) { t1 = time.Now() },
-		ConnectStart: func(_, _ string) {
-			if t1.IsZero() {
-				// connecting to IP
-				t1 = time.Now()
-			}
-		},
-		ConnectDone: func(net, addr string, err error) {
-			if err != nil {
-				log.Fatalf("unable to connect to host %v: %v", addr, err)
-			}
-			t2 = time.Now()
-
-			printf("\n%s%s\n", color.GreenString("Connected to "), color.CyanString(addr))
-		},
-		GotConn:              func(_ httptrace.GotConnInfo) { t3 = time.Now() },
-		GotFirstResponseByte: func() { t4 = time.Now() },
-		TLSHandshakeStart:    func() { t5 = time.Now() },
-		TLSHandshakeDone:     func(_ tls.ConnectionState, _ error) { t6 = time.Now() },
-	}
-	req = req.WithContext(httptrace.WithClientTrace(context.Background(), trace))
-
-	tr := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ForceAttemptHTTP2:     true,
-	}
-
-	switch {
-	case fourOnly:
-		tr.DialContext = dialContext("tcp4")
-	case sixOnly:
-		tr.DialContext = dialContext("tcp6")
-	}
-
-	switch url.Scheme {
-	case "https":
-		host, _, err := net.SplitHostPort(req.Host)
-		if err != nil {
-			host = req.Host
-		}
-
-		tr.TLSClientConfig = &tls.Config{
-			ServerName:         host,
-			InsecureSkipVerify: insecure,
-			Certificates:       readClientCert(clientCertFile),
-			MinVersion:         tls.VersionTLS12,
-		}
-	}
-
-	client := &http.Client{
-		Transport: tr,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// always refuse to follow redirects, visit does that
-			// manually if required.
-			return http.ErrUseLastResponse
-		},
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Fatalf("failed to read response: %v", err)
-	}
-
-	// Print SSL/TLS version which is used for connection
-	connectedVia := "plaintext"
-	if resp.TLS != nil {
-		switch resp.TLS.Version {
-		case tls.VersionTLS12:
-			connectedVia = "TLSv1.2"
-		case tls.VersionTLS13:
-			connectedVia = "TLSv1.3"
-		}
-	}
-	printf("\n%s %s\n", color.GreenString("Connected via"), color.CyanString("%s", connectedVia))
-
-	bodyMsg := readResponseBody(req, resp)
-	resp.Body.Close()
-
-	t7 := time.Now() // after read body
-	if t0.IsZero() {
-		// we skipped DNS
-		t0 = t1
-	}
-
-	// print status line and headers
-	printf("\n%s%s%s\n", color.GreenString("HTTP"), grayscale(14)("/"), color.CyanString("%d.%d %s", resp.ProtoMajor, resp.ProtoMinor, resp.Status))
-
-	names := make([]string, 0, len(resp.Header))
-	for k := range resp.Header {
-		names = append(names, k)
-	}
-	sort.Sort(headers(names))
-	for _, k := range names {
-		printf("%s %s\n", grayscale(14)(k+":"), color.CyanString(strings.Join(resp.Header[k], ",")))
-	}
-
-	if bodyMsg != "" {
-		printf("\n%s\n", bodyMsg)
-	}
-
-	fmta := func(d time.Duration) string {
-		return color.CyanString("%7dms", int(d/time.Millisecond))
-	}
-
-	fmtb := func(d time.Duration) string {
-		return color.CyanString("%-9s", strconv.Itoa(int(d/time.Millisecond))+"ms")
-	}
-
-	colorize := func(s string) string {
-		v := strings.Split(s, "\n")
-		v[0] = grayscale(16)(v[0])
-		return strings.Join(v, "\n")
-	}
-
-	fmt.Println()
-
-	switch url.Scheme {
-	case "https":
-		printf(colorize(httpsTemplate),
-			fmta(t1.Sub(t0)), // dns lookup
-			fmta(t2.Sub(t1)), // tcp connection
-			fmta(t6.Sub(t5)), // tls handshake
-			fmta(t4.Sub(t3)), // server processing
-			fmta(t7.Sub(t4)), // content transfer
-			fmtb(t1.Sub(t0)), // namelookup
-			fmtb(t2.Sub(t0)), // connect
-			fmtb(t3.Sub(t0)), // pretransfer
-			fmtb(t4.Sub(t0)), // starttransfer
-			fmtb(t7.Sub(t0)), // total
-		)
-	case "http":
-		printf(colorize(httpTemplate),
-			fmta(t1.Sub(t0)), // dns lookup
-			fmta(t3.Sub(t1)), // tcp connection
-			fmta(t4.Sub(t3)), // server processing
-			fmta(t7.Sub(t4)), // content transfer
-			fmtb(t1.Sub(t0)), // namelookup
-			fmtb(t3.Sub(t0)), // connect
-			fmtb(t4.Sub(t0)), // starttransfer
-			fmtb(t7.Sub(t0)), // total
-		)
-	}
-
-	if followRedirects && isRedirect(resp) {
-		loc, err := resp.Location()
-		if err != nil {
-			if err == http.ErrNoLocation {
-				// 30x but no Location to follow, give up.
-				return
-			}
-			log.Fatalf("unable to follow redirect: %v", err)
-		}
-
-		redirectsFollowed++
-		if redirectsFollowed > maxRedirects {
-			log.Fatalf("maximum number of redirects (%d) followed", maxRedirects)
-		}
-
-		visit(loc)
 	}
 }
 
